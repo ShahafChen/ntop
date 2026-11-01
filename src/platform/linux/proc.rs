@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use crate::model::Gpu;
+
 /// Value of a `Key:   123 ...` line (first token after the key), 0 when absent.
 fn kv(s: &str, key: &str) -> u64 {
     s.lines()
@@ -11,24 +13,25 @@ fn kv(s: &str, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct CpuTimes {
     pub busy: u64,
     pub total: u64,
-    pub cores: usize,
+    /// (busy, total) jiffies per core, in cpu0.. order.
+    pub cores: Vec<(u64, u64)>,
 }
 
-/// `/proc/stat`: aggregate jiffies over all cores plus the core count.
+/// `/proc/stat`: aggregate and per-core jiffies.
 pub fn parse_stat_cpu(s: &str) -> CpuTimes {
     let mut t = CpuTimes::default();
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("cpu ") {
-            let v: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-            t.total = v.iter().sum();
-            let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
-            t.busy = t.total.saturating_sub(idle);
-        } else if line.starts_with("cpu") {
-            t.cores += 1;
+    for line in s.lines().filter(|l| l.starts_with("cpu")) {
+        let v: Vec<u64> = line.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+        let total: u64 = v.iter().sum();
+        let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
+        if line.starts_with("cpu ") {
+            (t.busy, t.total) = (total.saturating_sub(idle), total);
+        } else {
+            t.cores.push((total.saturating_sub(idle), total));
         }
     }
     t
@@ -93,6 +96,7 @@ pub fn parse_diskstats(s: &str, is_disk: impl Fn(&str) -> bool) -> (u64, u64) {
 pub struct PidStat {
     pub name: String,
     pub state: char,
+    pub ppid: u32,
     /// utime + stime in jiffies.
     pub ticks: u64,
 }
@@ -105,6 +109,7 @@ pub fn parse_pid_stat(s: &str) -> Option<PidStat> {
     Some(PidStat {
         name: s[open + 1..close].to_string(),
         state: f.first()?.chars().next()?,
+        ppid: f.get(1)?.parse().ok()?,
         ticks: f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?,
     })
 }
@@ -140,6 +145,46 @@ pub fn parse_passwd(s: &str) -> HashMap<u32, String> {
         .collect()
 }
 
+/// `nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits`
+/// → one `Gpu` per line (memory in MiB).
+pub fn parse_nvidia_smi(s: &str) -> Vec<Gpu> {
+    s.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(',').map(str::trim).collect();
+            if f.len() < 5 {
+                return None;
+            }
+            let mib = |x: &str| x.parse::<u64>().unwrap_or(0) << 20;
+            Some(Gpu {
+                name: f[0].to_string(),
+                util_pct: f[1].parse().unwrap_or(0.0),
+                mem_used: mib(f[2]),
+                mem_total: mib(f[3]),
+                temp_c: f[4].parse().ok(),
+            })
+        })
+        .collect()
+}
+
+/// `ss -tinHOp` (one line per TCP socket with tcp_info) → pid → (bytes received, bytes sent).
+/// A socket shared by several processes is charged to the first one listed.
+pub fn parse_ss(s: &str) -> HashMap<u32, (u64, u64)> {
+    let num = |line: &str, key: &str| -> u64 {
+        line.split(key).nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).and_then(|v| v.parse().ok()).unwrap_or(0)
+    };
+    let mut out: HashMap<u32, (u64, u64)> = HashMap::new();
+    for line in s.lines() {
+        let pid = num(line, "pid=") as u32;
+        if pid == 0 {
+            continue;
+        }
+        let e = out.entry(pid).or_default();
+        e.0 += num(line, "bytes_received:");
+        e.1 += num(line, "bytes_sent:");
+    }
+    out
+}
+
 /// `/proc/loadavg` → the three load averages.
 pub fn parse_loadavg(s: &str) -> [f64; 3] {
     let mut it = s.split_whitespace().map(|x| x.parse().unwrap_or(0.0));
@@ -158,7 +203,7 @@ mod tests {
     #[test]
     fn stat_cpu() {
         let s = "cpu  10 2 5 100 3 0 1 0 0 0\ncpu0 5 1 2 50 1 0 0 0 0 0\ncpu1 5 1 3 50 2 0 1 0 0 0\nintr 1 2\n";
-        assert_eq!(parse_stat_cpu(s), CpuTimes { busy: 18, total: 121, cores: 2 });
+        assert_eq!(parse_stat_cpu(s), CpuTimes { busy: 18, total: 121, cores: vec![(8, 59), (10, 62)] });
     }
 
     #[test]
@@ -184,7 +229,7 @@ mod tests {
     #[test]
     fn pid_stat_with_spaces_in_name() {
         let s = "1234 (my (odd) proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 7 3 0 0 20 0 2 0 100 1000 50 0";
-        assert_eq!(parse_pid_stat(s), Some(PidStat { name: "my (odd) proc".into(), state: 'S', ticks: 10 }));
+        assert_eq!(parse_pid_stat(s), Some(PidStat { name: "my (odd) proc".into(), state: 'S', ppid: 1, ticks: 10 }));
     }
 
     #[test]
@@ -199,6 +244,17 @@ mod tests {
         assert_eq!(container_id(&format!("0::/system.slice/docker-{id}.scope\n")), Some("a".repeat(12)));
         assert_eq!(container_id(&format!("12:cpu:/docker/{id}\n")), Some("a".repeat(12)));
         assert_eq!(container_id("0::/user.slice/user-1000.slice\n"), None);
+    }
+
+    #[test]
+    fn nvidia_and_ss() {
+        let g = parse_nvidia_smi("NVIDIA GeForce RTX 3080, 12, 1024, 10240, 45\nbroken\n");
+        assert_eq!(g.len(), 1);
+        assert_eq!((g[0].name.as_str(), g[0].util_pct, g[0].mem_used, g[0].mem_total, g[0].temp_c), ("NVIDIA GeForce RTX 3080", 12.0, 1 << 30, 10 << 30, Some(45.0)));
+        let ss = "ESTAB 0 0 10.0.0.1:443 10.0.0.2:5555 users:((\"nginx\",pid=123,fd=10),(\"nginx\",pid=124,fd=10)) cubic bytes_sent:1000 bytes_acked:1000 bytes_received:50\n\
+                  ESTAB 0 0 10.0.0.1:22 10.0.0.9:1 users:((\"sshd\",pid=123,fd=3)) bytes_sent:7 bytes_received:3\nLISTEN 0 0 *:80 *:* \n";
+        assert_eq!(parse_ss(ss)[&123], (53, 1007));
+        assert_eq!(parse_ss(ss).len(), 1);
     }
 
     #[test]

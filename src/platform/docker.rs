@@ -16,7 +16,23 @@ pub struct DockerState {
     pub error: Option<String>,
 }
 
-pub fn spawn_poller() -> Arc<Mutex<DockerState>> {
+/// `None` when Docker support is switched off.
+pub fn spawn_poller(enabled: bool) -> Option<Arc<Mutex<DockerState>>> {
+    enabled.then(spawn)
+}
+
+/// (containers, error) from the poller; empty when disabled.
+pub fn snapshot(state: &Option<Arc<Mutex<DockerState>>>) -> (Vec<Container>, Option<String>) {
+    match state {
+        Some(s) => {
+            let d = s.lock().unwrap_or_else(|e| e.into_inner());
+            (d.containers.clone(), d.error.clone())
+        }
+        None => (Vec::new(), None),
+    }
+}
+
+fn spawn() -> Arc<Mutex<DockerState>> {
     let state = Arc::new(Mutex::new(DockerState::default()));
     let shared = Arc::clone(&state);
     thread::spawn(move || loop {

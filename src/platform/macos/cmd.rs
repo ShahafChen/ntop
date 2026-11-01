@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use crate::model::Gpu;
+
 /// `sysctl key1 key2 ...` → key → value.
 pub fn parse_sysctl(s: &str) -> HashMap<String, String> {
     s.lines()
@@ -76,6 +78,7 @@ pub fn parse_ioreg_disk(s: &str) -> (u64, u64) {
 #[derive(Debug, PartialEq)]
 pub struct PsRow {
     pub pid: u32,
+    pub ppid: u32,
     pub uid: u32,
     pub state: char,
     pub rss_bytes: u64,
@@ -84,7 +87,7 @@ pub struct PsRow {
     pub exe: String,
 }
 
-/// `ps -axo pid=,uid=,state=,rss=,time=,comm= -ww`.
+/// `ps -axo pid=,ppid=,uid=,state=,rss=,time=,comm= -ww`.
 pub fn parse_ps(s: &str) -> Vec<PsRow> {
     s.lines().filter_map(parse_ps_line).collect()
 }
@@ -97,11 +100,12 @@ fn parse_ps_line(line: &str) -> Option<PsRow> {
         Some(tok)
     };
     let pid = next()?.parse().ok()?;
+    let ppid = next()?.parse().ok()?;
     let uid = next()?.parse().ok()?;
     let state = next()?.chars().next()?;
     let rss_bytes = next()?.parse::<u64>().ok()? * 1024;
     let cpu_ms = parse_cputime_ms(next()?);
-    Some(PsRow { pid, uid, state, rss_bytes, cpu_ms, exe: rest.trim_end().to_string() })
+    Some(PsRow { pid, ppid, uid, state, rss_bytes, cpu_ms, exe: rest.trim_end().to_string() })
 }
 
 /// `ps -axo pid=,args= -ww` → pid → full command line.
@@ -122,6 +126,28 @@ pub fn parse_cputime_ms(s: &str) -> u64 {
         secs = secs * 60.0 + part.parse::<f64>().unwrap_or(0.0);
     }
     ((days as f64 * 86_400.0 + secs) * 1000.0).round() as u64
+}
+
+/// `nettop -P -L 1 -x -J bytes_in,bytes_out` (CSV, "name.pid,in,out,") → pid → (bytes in, bytes out).
+pub fn parse_nettop(s: &str) -> HashMap<u32, (u64, u64)> {
+    s.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(',').collect();
+            let pid = f.first()?.rsplit('.').next()?.parse().ok()?;
+            Some((pid, (f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?)))
+        })
+        .collect()
+}
+
+/// `ioreg -r -d 1 -c IOAccelerator` → the GPU's utilisation and memory, if the accelerator reports them.
+pub fn parse_ioreg_gpu(s: &str) -> Option<Gpu> {
+    let num = |key: &str| -> Option<f64> { s.split(key).nth(1)?.trim_start_matches('=').split(|c: char| !c.is_ascii_digit()).next()?.parse().ok() };
+    Some(Gpu {
+        name: "GPU".to_string(),
+        util_pct: num("\"Device Utilization %\"")?,
+        mem_used: num("\"In use system memory\"").unwrap_or(0.0) as u64,
+        ..Default::default()
+    })
 }
 
 /// `dscl . -list /Users UniqueID` → uid → user name.
@@ -172,13 +198,22 @@ mod tests {
 
     #[test]
     fn ps_rows_and_cputime() {
-        let rows = parse_ps("    1     0 Ss     9280 329:25.16 /sbin/launchd\n  500   501 R+      100  1-02:03:04.50 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\nbad line\n");
+        let rows = parse_ps("    1     0     0 Ss     9280 329:25.16 /sbin/launchd\n  500     1   501 R+      100  1-02:03:04.50 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\nbad line\n");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], PsRow { pid: 1, uid: 0, state: 'S', rss_bytes: 9280 * 1024, cpu_ms: 329 * 60_000 + 25_160, exe: "/sbin/launchd".into() });
+        assert_eq!(rows[0], PsRow { pid: 1, ppid: 0, uid: 0, state: 'S', rss_bytes: 9280 * 1024, cpu_ms: 329 * 60_000 + 25_160, exe: "/sbin/launchd".into() });
         assert_eq!(rows[1].cpu_ms, 86_400_000 + 2 * 3_600_000 + 3 * 60_000 + 4_500);
         assert_eq!(rows[1].exe, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
         assert_eq!(parse_cputime_ms("0:00.12"), 120);
         assert_eq!(parse_ps_args("  500 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=renderer\n")[&500], "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=renderer");
+    }
+
+    #[test]
+    fn nettop_and_gpu() {
+        let n = parse_nettop(",bytes_in,bytes_out,\nkernel_task.0,5944614,0,\nGoogle Chrome H.1234,10,20,\n");
+        assert_eq!((n[&0], n[&1234], n.len()), ((5944614, 0), (10, 20), 2));
+        let g = parse_ioreg_gpu("| \"PerformanceStatistics\" = {\"Renderer Utilization %\"=1,\"Device Utilization %\"=12,\"In use system memory\"=290537472}\n").unwrap();
+        assert_eq!((g.util_pct, g.mem_used), (12.0, 290537472));
+        assert!(parse_ioreg_gpu("nothing").is_none());
     }
 
     #[test]
