@@ -1,0 +1,9 @@
+[package]
+name = "nstop"
+version = "0.1.0"
+edition = "2021"
+description = "Task-manager style terminal system monitor with Docker awareness"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
