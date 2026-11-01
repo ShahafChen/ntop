@@ -25,7 +25,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let s = &app.snap.system;
-    let block = Block::bordered().title(format!(" nstop │ {} │ up {} │ load {:.2} {:.2} {:.2} ", s.hostname, uptime(s.uptime_secs), s.load_avg[0], s.load_avg[1], s.load_avg[2]));
+    let block = Block::bordered().title(format!(" ntop │ {} │ up {} │ load {:.2} {:.2} {:.2} ", s.hostname, uptime(s.uptime_secs), s.load_avg[0], s.load_avg[1], s.load_avg[2]));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let [top, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);

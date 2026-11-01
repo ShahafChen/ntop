@@ -1,29 +1,16 @@
 //! Linux backend: reads `/proc`, `/sys` and `/etc/passwd`, and the `docker` CLI for containers.
 
-mod docker;
 mod proc;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
-use super::Collector;
+use super::{docker, Collector, Counters, Rates};
 use crate::model::{Process, Snapshot, SystemStats};
-use proc::CpuTimes;
-
-/// What the previous sample saw; rates are deltas against this.
-struct Prev {
-    time: Instant,
-    cpu: CpuTimes,
-    net: (u64, u64),
-    disk: (u64, u64),
-    /// pid → (cpu ticks, read bytes, write bytes)
-    procs: HashMap<u32, (u64, u64, u64)>,
-}
 
 pub struct LinuxCollector {
-    prev: Option<Prev>,
+    rates: Rates,
     users: HashMap<u32, String>,
     disks: HashSet<String>,
     docker: Arc<Mutex<docker::DockerState>>,
@@ -45,7 +32,7 @@ impl LinuxCollector {
             })
             .unwrap_or_default();
         Self {
-            prev: None,
+            rates: Rates::default(),
             users: proc::parse_passwd(&read("/etc/passwd")),
             disks,
             docker: docker::spawn_poller(),
@@ -78,7 +65,6 @@ impl LinuxCollector {
 
 impl Collector for LinuxCollector {
     fn sample(&mut self) -> Snapshot {
-        let now = Instant::now();
         let cpu = proc::parse_stat_cpu(&read("/proc/stat"));
         let mem = proc::parse_meminfo(&read("/proc/meminfo"));
         let net = proc::parse_net_dev(&read("/proc/net/dev"));
@@ -94,11 +80,11 @@ impl Collector for LinuxCollector {
             .map(|d| d.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok()).collect::<Vec<_>>())
             .unwrap_or_default();
         let mut processes = Vec::with_capacity(pids.len());
-        let mut cur = HashMap::with_capacity(pids.len());
+        let mut cur = Counters { cpu_busy: cpu.busy, cpu_total: cpu.total, net, disk, procs: HashMap::new() };
         for pid in pids {
             if let Some((p, counters)) = self.read_process(pid, &names) {
                 processes.push(p);
-                cur.insert(pid, counters);
+                cur.procs.insert(pid, counters);
             }
         }
 
@@ -114,23 +100,7 @@ impl Collector for LinuxCollector {
             ..Default::default()
         };
 
-        if let Some(prev) = &self.prev {
-            let dt = now.duration_since(prev.time).as_secs_f64().max(1e-3);
-            let d_total = cpu.total.saturating_sub(prev.cpu.total).max(1) as f64;
-            system.cpu_pct = cpu.busy.saturating_sub(prev.cpu.busy) as f64 / d_total * 100.0;
-            system.net_rx_bps = net.0.saturating_sub(prev.net.0) as f64 / dt;
-            system.net_tx_bps = net.1.saturating_sub(prev.net.1) as f64 / dt;
-            system.disk_read_bps = disk.0.saturating_sub(prev.disk.0) as f64 / dt;
-            system.disk_write_bps = disk.1.saturating_sub(prev.disk.1) as f64 / dt;
-            for p in &mut processes {
-                let (ticks, rd, wr) = cur[&p.pid];
-                let (t0, r0, w0) = prev.procs.get(&p.pid).copied().unwrap_or((0, 0, 0));
-                p.cpu_pct = ticks.saturating_sub(t0) as f64 / d_total * 100.0;
-                p.disk_read_bps = rd.saturating_sub(r0) as f64 / dt;
-                p.disk_write_bps = wr.saturating_sub(w0) as f64 / dt;
-            }
-        }
-        self.prev = Some(Prev { time: now, cpu, net, disk, procs: cur });
+        self.rates.apply(cur, &mut system, &mut processes);
 
         Snapshot { system, processes, containers, docker_error }
     }

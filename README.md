@@ -1,10 +1,11 @@
-# nstop
+# ntop
 
 A Windows-Task-Manager-style system monitor for the terminal, in the spirit of `htop`/`btop`,
 with first-class Docker awareness. Written in Rust with [ratatui](https://ratatui.rs).
+Runs on Linux and macOS.
 
 ```
-┌ nstop │ myhost │ up 6d 16h │ load 2.65 1.38 0.72 ─────────────────────────────────────────┐
+┌ ntop │ myhost │ up 6d 16h │ load 2.65 1.38 0.72 ─────────────────────────────────────────┐
 │███████     CPU 11.1% (10 cores)      ██████████  MEM 1.7G / 7.7G        SWAP 0B / 1.0G    │
 │ NET ↓  1.2M/s  ↑ 300.0K/s   │   DISK read  5.0M/s  write 1.0M/s   │   210 processes, 5 containers
 └───────────────────────────────────────────────────────────────────────────────────────────┘
@@ -46,13 +47,13 @@ and the number of processes inside.
 ## Install
 
 Requires a Rust toolchain (`curl https://sh.rustup.rs -sSf | sh`) and, for the Docker pane,
-the `docker` CLI with access to the daemon.
+the `docker` CLI with access to the daemon. Same steps on Linux and macOS:
 
 ```sh
-git clone https://github.com/ShahafChen/nstop.git
-cd nstop
-make            # builds target/release/nstop
-sudo make install   # copies it to /usr/local/bin/nstop
+git clone https://github.com/ShahafChen/ntop.git
+cd ntop
+make            # builds target/release/ntop
+sudo make install   # copies it to /usr/local/bin/ntop
 ```
 
 No toolchain on the machine? `make docker-build` builds the Linux binary inside the official
@@ -63,12 +64,13 @@ Other targets: `make run`, `make test`, `make uninstall`, `make clean`.
 ## Usage
 
 ```sh
-nstop
+ntop
 ```
 
-Run it as root (`sudo nstop`) to see disk I/O for *other users'* processes; the kernel hides
-`/proc/<pid>/io` from non-owners, so those rows show `0B/s` otherwise. The Docker pane needs the
-current user in the `docker` group (or root); if `docker stats` fails the pane title shows why.
+Run it as root (`sudo ntop`) to see disk I/O for *other users'* processes; both kernels hide
+per-process I/O counters from non-owners, so those rows show `0B/s` otherwise. The Docker pane
+needs access to the Docker daemon (Linux: user in the `docker` group, or root; macOS: Docker
+Desktop running); if `docker stats` fails the pane title shows why.
 
 The screen refreshes once per second.
 
@@ -103,22 +105,26 @@ src/
   ui.rs               ratatui rendering
   platform/
     mod.rs            `Collector` trait + `collector()` factory, selects the backend by target OS
+                        also `Counters` + `Rates`: shared "two samples → rates" math
+    docker.rs         `docker stats` command runner + parser, polled on a background thread (shared)
     linux/
-      mod.rs          LinuxCollector: reads /proc, /sys/block, /etc/passwd; computes rates
+      mod.rs          LinuxCollector: reads /proc, /sys/block, /etc/passwd
       proc.rs         pure parsers for /proc text (unit tested, no I/O)
-      docker.rs       `docker stats` command runner + parser, polled on a background thread
+    macos/
+      mod.rs          MacCollector: runs sysctl, vm_stat, netstat -ib, ioreg, ps, dscl; proc_pid_rusage for per-process disk I/O
+      cmd.rs          pure parsers for those commands' output (unit tested, no I/O)
 ```
 
 Everything OS-specific lives in `src/platform/<os>/`. The rest of the program only sees the
-`Collector` trait and the structs in `model.rs`.
+`Collector` trait and the structs in `model.rs`. A backend reads raw monotonic counters into a
+`Counters` value and hands it to `Rates::apply`, which does all the delta/rate arithmetic.
 
-### Porting to macOS (or another OS)
+### Porting to another OS
 
-1. Create `src/platform/macos/` with a `MacCollector` implementing `platform::Collector`
-   (e.g. parse `ps`, `vm_stat`, `netstat -ib`, `iostat`; the `docker.rs` module can be reused
-   as-is since it only shells out to the `docker` CLI).
-2. In `src/platform/mod.rs` add `#[cfg(target_os = "macos")] pub mod macos;` and a matching
-   `collector()` branch, and drop the `compile_error!` for that target.
+1. Create `src/platform/<os>/` with a collector implementing `platform::Collector`
+   (`docker.rs` is reusable as-is since it only shells out to the `docker` CLI).
+2. In `src/platform/mod.rs` add `#[cfg(target_os = "<os>")] pub mod <os>;` and a matching
+   `collector()` branch, and extend the `compile_error!` guard.
 
 Nothing in `model.rs`, `app.rs` or `ui.rs` needs to change.
 
@@ -131,7 +137,11 @@ Nothing in `model.rs`, `app.rs` or `ui.rs` needs to change.
   `docker stats` reports), not rates.
 - The system NET rate skips `lo`, `veth*`, `docker*` and `br-*` so container traffic is not
   counted twice; other virtual interfaces are included.
-- Linux only for now (tested on Debian/Ubuntu kernels; cgroup v1 and v2).
+- Linux: tested on Debian/Ubuntu kernels; cgroup v1 and v2.
+- macOS: overall CPU % is the sum of per-process CPU time, so time spent by processes that
+  exited between two samples is not counted. Disk rates come from `ioreg` block-storage
+  statistics and include every attached disk (disk images too). The CONTAINER column is always
+  empty because Docker Desktop runs containers in a VM; the Docker pane still works.
 
 ## License
 

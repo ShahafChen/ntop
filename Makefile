@@ -1,7 +1,7 @@
-# nstop — build / run / install. Needs a Rust toolchain (https://rustup.rs) or Docker for `docker-build`.
+# ntop — build / run / install. Needs a Rust toolchain (https://rustup.rs) or Docker for `docker-build`.
 CARGO  ?= cargo
 PREFIX ?= /usr/local
-BIN     = target/release/nstop
+BIN     = target/release/ntop
 
 .PHONY: build run test install uninstall clean docker-build
 
@@ -15,10 +15,10 @@ test:
 	$(CARGO) test
 
 install: build
-	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/nstop
+	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/ntop
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/nstop
+	rm -f $(DESTDIR)$(PREFIX)/bin/ntop
 
 clean:
 	$(CARGO) clean
